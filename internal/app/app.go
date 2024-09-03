@@ -33,6 +33,7 @@ type App struct {
 	cluster             *mysql.Cluster
 	filelock            *flock.Flock
 	nodeFailedAt        map[string]time.Time
+	slaveReadPositions  map[string]string
 	streamFromFailedAt  map[string]time.Time
 	daemonState         *DaemonState
 	daemonMutex         sync.Mutex
@@ -71,6 +72,7 @@ func NewApp(configFile, logLevel string, interactive bool) (*App, error) {
 		nodeFailedAt:        make(map[string]time.Time),
 		streamFromFailedAt:  make(map[string]time.Time),
 		replRepairState:     make(map[string]*ReplicationRepairState),
+		slaveReadPositions:  make(map[string]string),
 		externalReplication: externalReplication,
 		switchHelper:        switchHelper,
 	}
@@ -107,7 +109,7 @@ func (app *App) baseContext() context.Context {
 func (app *App) connectDCS() error {
 	var err error
 	// TODO: support other DCS systems
-	app.dcs, err = dcs.NewZookeeper(&app.config.Zookeeper, app.logger)
+	app.dcs, err = dcs.NewZookeeper(app.baseContext(), &app.config.Zookeeper, app.logger)
 	if err != nil {
 		return fmt.Errorf("failed to connect to zkDCS: %s", err.Error())
 	}
@@ -159,26 +161,6 @@ func (app *App) removeMaintenanceFile() {
 	if err != nil && !os.IsNotExist(err) {
 		app.logger.Errorf("failed to remove maintenance file: %v", err)
 	}
-}
-
-// Dynamically calculated version of RplSemiSyncMasterWaitForSlaveCount.
-// This variable can be lower than hard-configured RplSemiSyncMasterWaitForSlaveCount
-// when some semi-sync replicas are dead.
-func (app *App) getRequiredWaitSlaveCount(activeNodes []string) int {
-	wsc := len(activeNodes) / 2
-	if wsc > app.config.RplSemiSyncMasterWaitForSlaveCount {
-		wsc = app.config.RplSemiSyncMasterWaitForSlaveCount
-	}
-	return wsc
-}
-
-// Number of HA nodes to be alive to failover/switchover
-func (app *App) getFailoverQuorum(activeNodes []string) int {
-	fq := len(activeNodes) - app.getRequiredWaitSlaveCount(activeNodes)
-	if fq < 1 {
-		fq = 1
-	}
-	return fq
 }
 
 // separate goroutine performing health checks
@@ -636,7 +618,7 @@ func (app *App) stateManager() appState {
 	// activeNodes are master + alive running replicas
 	activeNodes, err := app.GetActiveNodes()
 	if err != nil {
-		app.logger.Errorf(err.Error())
+		app.logger.Error(err.Error())
 		return stateManager
 	}
 	app.logger.Infof("active: %v", activeNodes)
@@ -701,7 +683,7 @@ func (app *App) stateManager() appState {
 		}
 		return stateManager
 	} else if err != dcs.ErrNotFound {
-		app.logger.Errorf(err.Error())
+		app.logger.Error(err.Error())
 		return stateManager
 	}
 
@@ -758,9 +740,11 @@ func (app *App) stateManager() appState {
 		app.logger.Errorf("failed to update active nodes in dcs: %v", err)
 	}
 
-	err = app.updateReplMonTS(master)
-	if err != nil {
-		app.logger.Errorf("failed to update repl_mon timestamp: %v", err)
+	if app.config.ReplMon {
+		err = app.updateReplMonTS(master)
+		if err != nil {
+			app.logger.Errorf("failed to update repl_mon timestamp: %v", err)
+		}
 	}
 
 	return stateManager
@@ -793,19 +777,13 @@ func (app *App) approveFailover(clusterState, clusterStateDcs map[string]*NodeSt
 	app.logger.Infof("approve failover: active nodes are %v", activeNodes)
 	// number of active slaves that we can use to perform switchover
 	permissibleSlaves := countAliveHASlavesWithinNodes(activeNodes, clusterState)
-	if app.config.SemiSync {
-		failoverQuorum := app.getFailoverQuorum(activeNodes)
-		if permissibleSlaves < failoverQuorum {
-			return fmt.Errorf("no quorum, have %d replics while %d is required", permissibleSlaves, failoverQuorum)
-		}
-	} else {
-		if permissibleSlaves == 0 {
-			return fmt.Errorf("no alive active replica found")
-		}
+	err := app.switchHelper.CheckFailoverQuorum(activeNodes, permissibleSlaves)
+	if err != nil {
+		return err
 	}
 
 	var lastSwitchover Switchover
-	err := app.dcs.Get(pathLastSwitch, &lastSwitchover)
+	err = app.dcs.Get(pathLastSwitch, &lastSwitchover)
 	if err != dcs.ErrNotFound {
 		if err != nil {
 			return err
@@ -863,15 +841,8 @@ func (app *App) approveSwitchover(switchover *Switchover, activeNodes []string, 
 	if switchover.RunCount > 0 {
 		return nil
 	}
-	if app.config.SemiSync {
-		// number of active slaves that we can use to perform switchover
-		permissibleSlaves := countAliveHASlavesWithinNodes(activeNodes, clusterState)
-		failoverQuorum := app.getFailoverQuorum(activeNodes)
-		if permissibleSlaves < failoverQuorum {
-			return fmt.Errorf("no quorum, have %d replics while %d is required", permissibleSlaves, failoverQuorum)
-		}
-	}
-	return nil
+	permissibleSlaves := countAliveHASlavesWithinNodes(activeNodes, clusterState)
+	return app.switchHelper.CheckFailoverQuorum(activeNodes, permissibleSlaves)
 }
 
 /*
@@ -911,7 +882,7 @@ func (app *App) calcActiveNodes(clusterState, clusterStateDcs map[string]*NodeSt
 			if node.PingDubious || clusterStateDcs[host].PingOk {
 				// we can't rely on ping and slave status if ping was dubios
 				if util.ContainsString(oldActiveNodes, host) {
-					app.logger.Warnf("calc active nodes: %s is dubious or keep heath lock in dcs, keeping active...", host)
+					app.logger.Warnf("calc active nodes: %s is dubious or keep health lock in dcs, keeping active...", host)
 					activeNodes = append(activeNodes, host)
 				}
 				continue
@@ -927,6 +898,7 @@ func (app *App) calcActiveNodes(clusterState, clusterStateDcs map[string]*NodeSt
 				}
 			} else {
 				app.logger.Errorf("calc active nodes: %s is down, deleting from active...", host)
+				delete(app.slaveReadPositions, host)
 			}
 			continue
 		} else {
@@ -938,7 +910,7 @@ func (app *App) calcActiveNodes(clusterState, clusterStateDcs map[string]*NodeSt
 			continue
 		}
 		sgtids := gtids.ParseGtidSet(sstatus.ExecutedGtidSet)
-		if sstatus.ReplicationState != mysql.ReplicationRunning || isSplitBrained(sgtids, mgtids, muuid) {
+		if sstatus.ReplicationState != mysql.ReplicationRunning || gtids.IsSplitBrained(sgtids, mgtids, muuid) {
 			app.logger.Errorf("calc active nodes: %s is not replicating or splitbrained, deleting from active...", host)
 			continue
 		}
@@ -949,7 +921,7 @@ func (app *App) calcActiveNodes(clusterState, clusterStateDcs map[string]*NodeSt
 	return activeNodes, nil
 }
 
-func (app *App) calcActiveNodesChanges(clusterState map[string]*NodeState, activeNodes []string, oldActiveNodes []string, master string) (becomeActive, becomeInactive []string, err error) {
+func (app *App) calcActiveNodesChanges(clusterState map[string]*NodeState, activeNodes []string, oldActiveNodes []string, master string) (becomeActive, becomeInactive, becomeDataLag []string, err error) {
 	masterNode := app.cluster.Get(master)
 	var syncReplicas []string
 	var deadReplicas []string
@@ -976,29 +948,39 @@ func (app *App) calcActiveNodesChanges(clusterState map[string]*NodeState, activ
 		}
 	}
 
+	var dataLagging []string
 	if len(becomeActive) > 0 {
 		// Some replicas are going to become semi-sync.
 		// We need to check that they downloaded (not replayed) almost all binary logs,
 		// in order to prevent master freezing.
 		// We can't check all the replicas on each iteration, because SHOW BINARY LOGS is pretty heavy request
-		var dataLagging []string
 		masterBinlogs, err := masterNode.GetBinlogs()
 		if err != nil {
 			app.logger.Errorf("calc active nodes: failed to list master binlogs on %s: %v", master, err)
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		for _, host := range becomeActive {
 			slaveState := clusterState[host].SlaveState
 			dataLag := calcLagBytes(masterBinlogs, slaveState.MasterLogFile, slaveState.MasterLogPos)
 			if dataLag > app.config.SemiSyncEnableLag {
-				app.logger.Warnf("calc active nodes: %v should become active, but it has data lag %d, delaying...", host, dataLag)
-				dataLagging = append(dataLagging, host)
-				becomeInactive = append(becomeInactive, host)
+				newBinLogPos := fmt.Sprintf("%s%019d", slaveState.MasterLogFile, slaveState.MasterLogPos)
+				oldBinLogPos := app.slaveReadPositions[host]
+
+				if newBinLogPos <= oldBinLogPos {
+					app.logger.Warnf("calc active nodes: %v should become active, but it has data lag %d and it's IO is stopped, delaying...", host, dataLag)
+					becomeInactive = append(becomeInactive, host)
+				} else {
+					app.logger.Warnf("calc active nodes: %v has data lag %d, but it's IO is working. Old binlog: %s, new binlog: %s", host, dataLag, oldBinLogPos, newBinLogPos)
+					dataLagging = append(dataLagging, host)
+				}
+
+				app.slaveReadPositions[host] = newBinLogPos
 			}
 		}
 		becomeActive = filterOut(becomeActive, dataLagging)
+		becomeActive = filterOut(becomeActive, becomeInactive)
 	}
-	return becomeActive, becomeInactive, nil
+	return becomeActive, becomeInactive, dataLagging, nil
 }
 
 /*
@@ -1037,7 +1019,7 @@ func (app *App) updateActiveNodes(clusterState, clusterStateDcs map[string]*Node
 		return nil
 	}
 
-	becomeActive, becomeInactive, err := app.calcActiveNodesChanges(clusterState, activeNodes, oldActiveNodes, master)
+	becomeActive, becomeInactive, becomeDataLag, err := app.calcActiveNodesChanges(clusterState, activeNodes, oldActiveNodes, master)
 	if err != nil {
 		app.logger.Errorf("update active nodes: failed to calc active nodes changes: %v", err)
 		return err
@@ -1046,7 +1028,7 @@ func (app *App) updateActiveNodes(clusterState, clusterStateDcs map[string]*Node
 	if masterState.SemiSyncState != nil && masterState.SemiSyncState.MasterEnabled {
 		oldWaitSlaveCount = masterState.SemiSyncState.WaitSlaveCount
 	}
-	waitSlaveCount := app.getRequiredWaitSlaveCount(activeNodes)
+	waitSlaveCount := app.switchHelper.GetRequiredWaitSlaveCount(activeNodes)
 
 	app.logger.Infof("update active nodes: active nodes are: %v, wait_slave_count %d", activeNodes, waitSlaveCount)
 	if len(becomeActive) > 0 {
@@ -1067,14 +1049,21 @@ func (app *App) updateActiveNodes(clusterState, clusterStateDcs map[string]*Node
 
 	// first, shrink HA-group, if needed
 	if waitSlaveCount > oldWaitSlaveCount {
-		err := app.adjustSemiSyncOnMaster(masterNode, clusterState[master], waitSlaveCount)
+		err := app.adjustSemiSyncOnMaster(masterNode, masterState, waitSlaveCount)
 		if err != nil {
 			app.logger.Errorf("failed to adjust semi-sync on master %s to %d: %v", masterNode.Host(), waitSlaveCount, err)
 			return err
 		}
 	}
 	for _, host := range becomeInactive {
-		err = app.disableSemiSyncOnSlave(host)
+		err = app.disableSemiSyncOnSlave(host, true)
+		if err != nil {
+			app.logger.Warnf("failed to disable semi-sync on slave %s: %v", host, err)
+			return err
+		}
+	}
+	for _, host := range becomeDataLag {
+		err = app.disableSemiSyncOnSlave(host, false)
 		if err != nil {
 			app.logger.Warnf("failed to disable semi-sync on slave %s: %v", host, err)
 			return err
@@ -1090,13 +1079,13 @@ func (app *App) updateActiveNodes(clusterState, clusterStateDcs map[string]*Node
 
 	// and finally enlarge HA-group, if needed
 	for _, host := range becomeActive {
-		err := app.enableSemiSyncOnSlave(host)
+		err := app.enableSemiSyncOnSlave(host, clusterState[host], masterState)
 		if err != nil {
 			app.logger.Errorf("failed to enable semi-sync on slave %s: %v", host, err)
 		}
 	}
 	if waitSlaveCount < oldWaitSlaveCount {
-		err := app.adjustSemiSyncOnMaster(masterNode, clusterState[master], waitSlaveCount)
+		err := app.adjustSemiSyncOnMaster(masterNode, masterState, waitSlaveCount)
 		if err != nil {
 			app.logger.Errorf("failed to adjust semi-sync on master %s to %d: %v", masterNode.Host(), waitSlaveCount, err)
 		}
@@ -1134,33 +1123,50 @@ func (app *App) adjustSemiSyncOnMaster(node *mysql.Node, state *NodeState, waitS
 	return nil
 }
 
-func (app *App) enableSemiSyncOnSlave(host string) error {
+func (app *App) enableSemiSyncOnSlave(host string, slaveState, masterState *NodeState) error {
 	node := app.cluster.Get(host)
 	err := node.SemiSyncSetSlave()
 	if err != nil {
 		app.logger.Errorf("failed to enable semi_sync_slave on %s: %s", host, err)
 		return err
 	}
-	err = node.RestartReplica()
-	if err != nil {
-		app.logger.Errorf("failed restart replication after set semi_sync_slave on %s: %s", host, err)
-		return err
+	masterGtidSet := gtids.ParseGtidSet(masterState.MasterState.ExecutedGtidSet)
+	slaveGtidSet := gtids.ParseGtidSet(slaveState.SlaveState.ExecutedGtidSet)
+
+	if gtids.IsSlaveAhead(slaveGtidSet, masterGtidSet) {
+		// we should restart only replicas ahead of the master
+		err = node.RestartReplica()
+		if err != nil {
+			app.logger.Errorf("failed restart replication after set semi_sync_slave on %s: %s", host, err)
+			return err
+		}
+	} else {
+		err = node.RestartSlaveIOThread()
+		if err != nil {
+			app.logger.Errorf("failed restart slave io thread after set semi_sync_slave on %s: %s", host, err)
+			return err
+		}
 	}
+
 	return nil
 }
 
-func (app *App) disableSemiSyncOnSlave(host string) error {
+func (app *App) disableSemiSyncOnSlave(host string, restartIOThread bool) error {
 	node := app.cluster.Get(host)
 	err := node.SemiSyncDisable()
 	if err != nil {
 		app.logger.Errorf("failed to enable semi_sync_slave on %s: %s", host, err)
 		return err
 	}
-	err = node.RestartSlaveIOThread()
-	if err != nil {
-		app.logger.Errorf("failed restart slave io thread after set semi_sync_slave on %s: %s", host, err)
-		return err
+
+	if restartIOThread {
+		err = node.RestartSlaveIOThread()
+		if err != nil {
+			app.logger.Errorf("failed restart slave io thread after set semi_sync_slave on %s: %s", host, err)
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -1187,9 +1193,7 @@ func (app *App) performSwitchover(clusterState map[string]*NodeState, activeNode
 		return fmt.Errorf("switchover: failed to ping hosts: %v with dubious errors", dubious)
 	}
 
-	// calc failoverQuorum before filtering out old master
-	failoverQuorum := app.getFailoverQuorum(activeNodes)
-	oldActiveNodes := activeNodes
+	activeNodesWithOldMaster := activeNodes
 
 	// filter out old master as may hang and timeout in different ways
 	if switchover.Cause == CauseAuto && switchover.From == oldMaster {
@@ -1258,8 +1262,9 @@ func (app *App) performSwitchover(clusterState map[string]*NodeState, activeNode
 			frozenActiveNodes = append(frozenActiveNodes, host)
 		}
 	}
-	if len(frozenActiveNodes) < failoverQuorum {
-		return fmt.Errorf("no failoverQuorum: has %d frozen active nodes, while %d is required", len(frozenActiveNodes), failoverQuorum)
+	err := app.switchHelper.CheckFailoverQuorum(activeNodesWithOldMaster, len(frozenActiveNodes))
+	if err != nil {
+		return err
 	}
 
 	// setting server read-only may take a while so we need to ensure we are still a manager
@@ -1400,7 +1405,7 @@ func (app *App) performSwitchover(clusterState map[string]*NodeState, activeNode
 
 	// adjust semi-sync before finishing switchover
 	clusterState = app.getClusterStateFromDB()
-	err = app.updateActiveNodes(clusterState, clusterState, oldActiveNodes, newMaster)
+	err = app.updateActiveNodes(clusterState, clusterState, activeNodesWithOldMaster, newMaster)
 	if err != nil || app.emulateError("update_active_nodes") {
 		app.logger.Warnf("switchover: failed to update active nodes after switchover: %v", err)
 	}
@@ -1857,12 +1862,13 @@ func (app *App) repairCascadeNode(node *mysql.Node, clusterState map[string]*Nod
 		}
 		app.logger.Debugf("repair: %s GTID set = %v, new stream_from GTID set is %v", host, myGITIDs, candidateGTIDs)
 
-		if !isGTIDLessOrEqual(myGITIDs, candidateGTIDs) && !isGTIDLessOrEqual(candidateGTIDs, myGITIDs) {
+		// TODO: replace with IsSplitBrained
+		if gtids.IsSlaveAhead(myGITIDs, candidateGTIDs) && gtids.IsSlaveAhead(candidateGTIDs, myGITIDs) {
 			app.logger.Errorf("repair: %s and %s are splitbrained...", host, upstreamCandidate)
 			app.writeEmergeFile("cascade replica splitbain detected")
 			return
 		}
-		if isGTIDLessOrEqual(myGITIDs, candidateGTIDs) {
+		if gtids.IsSlaveBehindOrEqual(myGITIDs, candidateGTIDs) {
 			app.logger.Infof("repair: new stream_from host GTID set is superset of our GTID set. Switching Master_Host, Starting replication")
 			err = app.performChangeMaster(host, upstreamCandidate)
 			if err != nil {
@@ -2321,7 +2327,7 @@ func (app *App) Run() int {
 
 	err := app.lockFile()
 	if err != nil {
-		app.logger.Errorf(err.Error())
+		app.logger.Error(err.Error())
 		return 1
 	}
 	defer app.unlockFile()
@@ -2331,14 +2337,14 @@ func (app *App) Run() int {
 
 	err = app.connectDCS()
 	if err != nil {
-		app.logger.Errorf(err.Error())
+		app.logger.Error(err.Error())
 		return 1
 	}
 	defer app.dcs.Close()
 
 	err = app.newDBCluster()
 	if err != nil {
-		app.logger.Errorf(err.Error())
+		app.logger.Error(err.Error())
 		return 1
 	}
 	defer app.cluster.Close()

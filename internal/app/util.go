@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/google/uuid"
 	"github.com/yandex/mysync/internal/log"
 	"github.com/yandex/mysync/internal/mysql"
 	"github.com/yandex/mysync/internal/mysql/gtids"
@@ -220,6 +218,15 @@ func getNodeStatesInParallel(hosts []string, getter func(string) (*NodeState, er
 	if err != nil {
 		return nil, err
 	}
+
+	// adding information about source to each replica
+	for host := range clusterState {
+		if clusterState[host].SlaveState == nil {
+			continue
+		}
+		masterHost := clusterState[host].SlaveState.MasterHost
+		clusterState[host].MasterState = clusterState[masterHost].MasterState
+	}
 	return clusterState, nil
 }
 
@@ -228,34 +235,8 @@ func isSlavePermanentlyLost(sstatus mysql.ReplicaStatus, masterGtidSet gtids.GTI
 		return true
 	}
 	slaveGtidSet := gtids.ParseGtidSet(sstatus.GetExecutedGtidSet())
-	return !isGTIDLessOrEqual(slaveGtidSet, masterGtidSet)
-}
-
-func isGTIDLessOrEqual(slaveGtidSet, masterGtidSet gtids.GTIDSet) bool {
-	return masterGtidSet.Contain(slaveGtidSet) || masterGtidSet.Equal(slaveGtidSet)
-}
-
-func isSplitBrained(slaveGtidSet, masterGtidSet gtids.GTIDSet, masterUUID uuid.UUID) bool {
-	mysqlSlaveGtidSet := slaveGtidSet.(*gomysql.MysqlGTIDSet)
-	mysqlMasterGtidSet := masterGtidSet.(*gomysql.MysqlGTIDSet)
-	for _, slaveSet := range mysqlSlaveGtidSet.Sets {
-		masterSet, ok := mysqlMasterGtidSet.Sets[slaveSet.SID.String()]
-		if !ok {
-			return true
-		}
-
-		if masterSet.Contain(slaveSet) {
-			continue
-		}
-
-		if masterSet.SID == masterUUID {
-			continue
-		}
-
-		return true
-	}
-
-	return false
+	// TODO: why ahead = lost?..
+	return gtids.IsSlaveAhead(slaveGtidSet, masterGtidSet)
 }
 
 func validatePriority(priority *int64) error {
